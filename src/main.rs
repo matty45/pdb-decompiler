@@ -2,6 +2,7 @@ mod cpp;
 mod debug_blocks;
 mod decompile;
 mod namespaces;
+mod legacy;
 mod options;
 mod param_const;
 mod reorganize;
@@ -59,9 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         options.pseudocode_json = pseudocode_json.unwrap();
     }
 
-    if let Err(error) = Decompiler::new(options).with_function_scopes_modules(function_scopes_modules).decompile() {
-        println!("ERROR: could not decompile PDB because it {error}");
-    }
+    Decompiler::new(options).with_function_scopes_modules(function_scopes_modules).decompile()?;
 
     Ok(())
 }

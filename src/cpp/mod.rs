@@ -1039,7 +1039,8 @@ pub fn type_size<'p>(
         })
         | pdb2::TypeData::Pointer(_)
         | pdb2::TypeData::Procedure(_) => match machine_type {
-            pdb2::MachineType::Unknown | pdb2::MachineType::X86 => Ok(4),
+            pdb2::MachineType::Unknown | pdb2::MachineType::X86
+            | pdb2::MachineType::PowerPC | pdb2::MachineType::PowerPCFP => Ok(4),
             pdb2::MachineType::Amd64 => Ok(8),
             _ => panic!("Unhandled machine type: {machine_type}")
         }

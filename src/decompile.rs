@@ -37,8 +37,9 @@ pub struct DecompileContext<'a, 's> {
     pub machine_type: pdb2::MachineType,
     pub address_map: &'a pdb2::AddressMap<'s>,
     pub string_table: Option<&'a pdb2::StringTable<'s>>,
-    pub id_info: &'a pdb2::IdInformation<'s>,
-    pub id_finder: pdb2::IdFinder<'a>,
+    pub id_info: Option<&'a pdb2::IdInformation<'s>>,
+    pub id_finder: Option<pdb2::IdFinder<'a>>,
+    pub source_files: HashMap<u16, Vec<String>>,
     pub type_info: &'a pdb2::TypeInformation<'s>,
     pub type_finder: pdb2::TypeFinder<'a>,
     pub global_symbols: &'a pdb2::SymbolTable<'s>,
@@ -152,14 +153,25 @@ impl Decompiler {
         let type_info = pdb.type_information()
             .map_err(|e| format!("does not contain type information: {e}"))?;
 
-        let id_info = pdb.id_information()
-            .map_err(|e| format!("does not contain id information: {e}"))?;
+        let info_stream = pdb.raw_stream(pdb2::StreamIndex(1))?
+            .ok_or("PDB information stream missing")?;
+        let id_info = if crate::legacy::has_ipi(info_stream.as_slice())? {
+            Some(pdb.id_information()?)
+        } else {
+            None
+        };
+        let dbi_stream = pdb.raw_stream(pdb2::StreamIndex(3))?
+            .ok_or("DBI stream missing")?;
+        let files = crate::legacy::source_files(dbi_stream.as_slice())?;
+        let source_files = debug_info.modules()?.collect::<Vec<_>>()?.iter()
+            .zip(files).map(|(module, files)| (module.info().stream.0, files))
+            .collect();
 
         let global_symbols = pdb.global_symbols()
             .map_err(|e| format!("does not contain global symbol information: {e}"))?;
         
         let type_finder = type_info.finder();
-        let id_finder = id_info.finder();
+        let id_finder = id_info.as_ref().map(|info| info.finder());
 
         // Map each public symbol's resolved address to its mangled name, so parameter
         // `const` lost from the type records can be recovered from the mangled name.
@@ -276,7 +288,8 @@ impl Decompiler {
             machine_type,
             address_map: &mut address_map,
             string_table: string_table.as_ref(),
-            id_info: &id_info,
+            id_info: id_info.as_ref(),
+            source_files,
             id_finder: id_finder,
             type_info: &type_info,
             type_finder: type_finder,
@@ -311,14 +324,14 @@ impl Decompiler {
     fn process_type_information<'a, 's>(&mut self, context: &mut DecompileContext<'a, 's>) -> pdb2::Result<()> {
         // println!("Processing type information...");
 
-        let export_all = context.id_info.is_empty();
+        let export_all = self.options.export_cpp && context.id_info.is_none_or(|info| info.is_empty());
 
         let mut type_iter = context.type_info.iter();
 
         let mut exported_forward_reference_indices = vec![];
         let mut exported_type_indices = vec![];
 
-        while let Ok(Some(type_item)) = type_iter.next() {
+        while let Some(type_item) = type_iter.next()? {
             context.type_finder.update(&type_iter);
             
             // Don't attempt to parse types we don't care about
@@ -384,7 +397,7 @@ impl Decompiler {
             }
         }
 
-        if exported_type_indices.is_empty() && exported_forward_reference_indices.is_empty() {
+        if !export_all {
             return Ok(());
         }
 
@@ -393,37 +406,43 @@ impl Decompiler {
         let mut module = cpp::Module::default();
         module.path = exported_path.clone();
 
+        let full_names = exported_type_indices.iter().filter_map(|index| {
+            context.type_finder.find(*index).ok()?.parse().ok()?.name().map(|n| n.to_string().into_owned())
+        }).collect::<HashSet<_>>();
         for type_index in exported_forward_reference_indices {
+            if context.type_finder.find(type_index)?.parse()?.name()
+                .is_some_and(|name| full_names.contains(name.to_string().as_ref())) { continue; }
             if let Err(e) = module.add_type_definition(&mut self.class_table, &mut self.type_sizes, &mut self.type_names, context.machine_type, &context.type_info, &context.type_finder, type_index, 0) {
                 panic!("{e}");
             }
         }
 
         for type_index in exported_type_indices {
+            if let Some(name) = context.type_finder.find(type_index)?.parse()?.name() {
+                if self.canonical_type_index.get(name.to_string().as_ref())
+                    .is_some_and(|canonical| *canonical != type_index) { continue; }
+            }
             if let Err(e) = module.add_type_definition(&mut self.class_table, &mut self.type_sizes, &mut self.type_names, context.machine_type, &context.type_info, &context.type_finder, type_index, 0) {
                 panic!("{e}");
             }
         }
 
+        let module = Rc::new(RefCell::new(module));
+        let mut symbols = context.global_symbols.iter();
+        while let Some(symbol) = symbols.next()? {
+            if let Ok(data @ pdb2::SymbolData::UserDefinedType(_)) = symbol.parse() {
+                self.process_module_symbol_data(context, &HashMap::new(), module.clone(), None, &data)?;
+            }
+        }
         if let Some(parent_path) = exported_path.parent()
             && let Err(e) = std::fs::create_dir_all(parent_path)
         {
             panic!("{e}");
         }
 
-        let mut file = if exported_path.exists() {
-            match OpenOptions::new().write(true).append(true).open(exported_path.clone()) {
-                Ok(x) => x,
-                Err(e) => panic!("{e}: {}", exported_path.to_string_lossy()),
-            }
-        } else {
-            match File::create(exported_path.clone()) {
-                Ok(x) => x,
-                Err(e) => panic!("{e}: {}", exported_path.to_string_lossy()),
-            }
-        };
+        let mut file = File::create(&exported_path).map_err(pdb2::Error::IoError)?;
 
-        if let Err(e) = write!(file, "{}", cpp::compact_std_templates(&cpp::shorten_std_aliases(&module.to_string()))) {
+        if let Err(e) = write!(file, "{}", cpp::compact_std_templates(&cpp::shorten_std_aliases(&module.borrow().to_string()))) {
             panic!("{e}");
         }
 
@@ -434,10 +453,12 @@ impl Decompiler {
     fn process_id_information<'a, 's>(&mut self, context: &mut DecompileContext<'a, 's>) -> pdb2::Result<()> {
         // println!("Processing id information...");
 
-        let mut id_iter = context.id_info.iter();
+        let Some(id_info) = context.id_info else { return Ok(()); };
+        let id_finder = context.id_finder.as_mut().unwrap();
+        let mut id_iter = id_info.iter();
 
         while let Some(id) = id_iter.next()? {
-            context.id_finder.update(&id_iter);
+            id_finder.update(&id_iter);
 
             let (pdb2::LF_BUILDINFO | pdb2::LF_UDT_SRC_LINE | pdb2::LF_UDT_MOD_SRC_LINE) = id.raw_kind() else {
                 continue;
@@ -454,7 +475,7 @@ impl Decompiler {
             match id_data {
                 pdb2::IdData::BuildInfo(build_info) => {
                     let mut module = cpp::Module::default();
-                    module.add_build_info(&mut context.id_finder, build_info)?;
+                    module.add_build_info(id_finder, build_info)?;
 
                     let Some(Component::Normal(_)) = module.path.components().last() else {
                         continue;
@@ -476,7 +497,7 @@ impl Decompiler {
                 
                 pdb2::IdData::UserDefinedTypeSource(data) => {
                     let module_path = match data.source_file {
-                        pdb2::UserDefinedTypeSourceFileRef::Local(id) => match context.id_finder.find(id) {
+                        pdb2::UserDefinedTypeSourceFileRef::Local(id) => match id_finder.find(id) {
                             Ok(item) => match item.parse() {
                                 Ok(pdb2::IdData::String(source_file)) => crate::utils::sanitize_path(&source_file.name.to_string()),
                                 Ok(data) => panic!("invalid UDT source file id: {:#?}", data),
@@ -487,7 +508,7 @@ impl Decompiler {
                         },
 
                         pdb2::UserDefinedTypeSourceFileRef::Remote(_, source_line_ref) => {
-                            crate::utils::sanitize_path(&source_line_ref.to_string_lossy(context.string_table.unwrap())?)
+                            crate::utils::sanitize_path(&source_line_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?)
                         }
                     };
 
@@ -529,7 +550,8 @@ impl Decompiler {
         let mut module_iter = context.debug_info.modules().map_err(|e| format!("does not contain debug module info: {e}"))?;
 
         while let Some(module) = module_iter.next().map_err(|e| format!("failed to get next debug module info: {e}"))? {
-            if let Err(_) = self.process_module(context, &module, &module_global_symbols) {
+            if let Err(error) = self.process_module(context, &module, &module_global_symbols) {
+                println!("WARNING: failed to process module {}: {error}", module.module_name());
                 // println!("WARNING: failed to parse module, skipping: {e} - {module:#?}");
                 continue;
             }
@@ -1182,6 +1204,7 @@ impl Decompiler {
             };
 
             match symbol_data {
+                pdb2::SymbolData::UserDefinedType(_) if context.id_info.is_none() => {}
                 pdb2::SymbolData::UserDefinedType(_) if prev_module_name.is_some() => {
                     let module_name = prev_module_name.clone().unwrap();
 
@@ -1262,14 +1285,29 @@ impl Decompiler {
             }
         };
 
-        let line_program = module_info.line_program()?;
-        let line_offsets = self.get_module_line_program_offsets(&line_program)?;
+        let line_program = module_info.line_program();
+        let line_offsets = if context.string_table.is_none() {
+            HashMap::new()
+        } else if let Ok(program) = &line_program {
+            self.get_module_line_program_offsets(program)?
+        } else if context.id_info.is_none() && pdb_module.info().c13_lines_size > 0 {
+            let stream = context.pdb.raw_stream(pdb_module.info().stream)?
+                .ok_or(pdb2::Error::StreamNotFound(pdb_module.info().stream.0 as u32))?;
+            let start = pdb_module.info().symbols_size as usize + pdb_module.info().lines_size as usize;
+            let end = start + pdb_module.info().c13_lines_size as usize;
+            crate::legacy::c13_lines(stream.as_slice().get(start..end).ok_or(pdb2::Error::UnexpectedEof)?)?
+        } else {
+            return Err(line_program.err().unwrap().into());
+        };
         
         let Some(module) = self.get_or_create_cpp_module(
             context,
             pdb_module,
             &module_info,
-            &line_program,
+            line_program.as_ref().ok(),
+            module_global_symbols.get(&pdb_module.module_name().to_string()).is_some_and(|symbols|
+                symbols.iter().any(|symbol| matches!(symbol, pdb2::SymbolData::Data(_)
+                    | pdb2::SymbolData::ThreadStorage(_) | pdb2::SymbolData::Procedure(_)))),
         )? else {
             println!(
                 "WARNING: Failed to find source file path for module \"{}\" in \"{}\", skipping...",
@@ -1306,7 +1344,7 @@ impl Decompiler {
                 }
             };
 
-            if let pdb2::SymbolData::UserDefinedType(_) = symbol_data {
+            if context.id_info.is_some() && matches!(symbol_data, pdb2::SymbolData::UserDefinedType(_)) {
                 continue;
             }
             
@@ -1379,7 +1417,8 @@ impl Decompiler {
         context: &mut DecompileContext<'a, 's>,
         module: &pdb2::Module,
         module_info: &pdb2::ModuleInfo,
-        line_program: &pdb2::LineProgram,
+        line_program: Option<&pdb2::LineProgram>,
+        has_global_definitions: bool,
     ) -> pdb2::Result<Option<Rc<RefCell<cpp::Module>>>> {
         let mut module_symbols = module_info.symbols()?;
         let mut module_file_path = None;
@@ -1387,11 +1426,12 @@ impl Decompiler {
         // Try to find build info for the module to get the module's source file path
         while let Some(symbol_item) = module_symbols.next()? {
             let Ok(pdb2::SymbolData::BuildInfo(build_info)) = symbol_item.parse() else { continue };
-            let Ok(id_item) = context.id_finder.find(build_info.id) else { continue };
+            let Some(id_finder) = context.id_finder.as_ref() else { continue };
+            let Ok(id_item) = id_finder.find(build_info.id) else { continue };
             let Ok(pdb2::IdData::BuildInfo(build_info)) = id_item.parse() else { continue };
             
             let mut module = cpp::Module::default();
-            module.add_build_info(&context.id_finder, build_info)?;
+            module.add_build_info(id_finder, build_info)?;
 
             if !module.path.as_os_str().is_empty() {
                 module_file_path = Some(module.path.clone());
@@ -1399,27 +1439,60 @@ impl Decompiler {
             }
         }
 
-        // If we didn't find the module's source file path from build info, try to find it based on the object file path
+        let mut environment = std::collections::BTreeMap::new();
+        let mut symbols = module_info.symbols()?;
+        while let Some(symbol) = symbols.next()? {
+            environment.extend(crate::legacy::build_environment(&symbol)?);
+        }
+        let cwd = environment.get("cwd").cloned().unwrap_or_default();
+        if module_file_path.is_none() {
+            if let Some(source) = environment.get("src").filter(|s| !s.is_empty()) {
+                module_file_path = Some(crate::utils::canonicalize_path(&cwd, source, false));
+            }
+        }
+
+        let mut source_files = context.source_files.get(&module.info().stream.0)
+            .cloned().unwrap_or_default().into_iter()
+            .map(|path| PathBuf::from(crate::utils::sanitize_path(path))).collect::<Vec<_>>();
+        if let (Some(strings), Some(line_program)) = (context.string_table, line_program) {
+            for file in line_program.files().collect::<Vec<_>>()? {
+                let path = PathBuf::from(crate::utils::sanitize_path(file.name.to_string_lossy(strings)?));
+                if !source_files.contains(&path) { source_files.push(path); }
+            }
+        }
+        // DBI file lists are available even when line records or /names are absent.
         if module_file_path.is_none() {
             let obj_path = self.get_module_object_file_path(module)?;
-            
-            for file in line_program.files().collect::<Vec<_>>()? {
-                let path = PathBuf::from(crate::utils::sanitize_path(&file.name.to_string_lossy(context.string_table.unwrap())?));
-
-                if let Some(extension) = path.extension()
-                    && cpp::SOURCE_FILE_EXTS.contains(&extension.to_str().unwrap_or(""))
-                    && path.file_stem().map(|x| x.to_ascii_lowercase()) == obj_path.file_stem().map(|x| x.to_ascii_lowercase())
-                {
-                    module_file_path = Some(path);
-                    break;
-                }
+            let candidates = source_files.iter().filter(|path| path.extension()
+                .is_some_and(|e| cpp::SOURCE_FILE_EXTS.iter().any(|ext| e.eq_ignore_ascii_case(ext))))
+                .collect::<Vec<_>>();
+            module_file_path = candidates.iter().find(|path|
+                path.file_stem().map(|x| x.to_ascii_lowercase()) == obj_path.file_stem().map(|x| x.to_ascii_lowercase()))
+                .map(|path| (*path).clone());
+            if module_file_path.is_none() && candidates.len() == 1 {
+                module_file_path = Some(candidates[0].clone());
             }
         }
 
         // If we couldn't find the module's source file path, we can't decompile it
-        let Some(module_file_path) = module_file_path else {
-            return Ok(None);
-        };
+        // under an original filename. Preserve useful symbols under an explicit fallback.
+        if module_file_path.is_none() && context.id_info.is_none() && has_global_definitions {
+            module_file_path = Some(PathBuf::from(format!("__pdb_modules/module_{}.cpp", module.info().stream.0)));
+            environment.insert("object".into(), module.module_name().into_owned());
+        }
+        if module_file_path.is_none() && context.id_info.is_none() {
+            let mut symbols = module_info.symbols()?;
+            while let Some(symbol) = symbols.next()? {
+                if matches!(symbol.parse(), Ok(pdb2::SymbolData::Procedure(_)
+                    | pdb2::SymbolData::Data(_) | pdb2::SymbolData::ThreadStorage(_)
+                    | pdb2::SymbolData::UserDefinedType(_) | pdb2::SymbolData::Constant(_))) {
+                    module_file_path = Some(PathBuf::from(format!("__pdb_modules/module_{}.cpp", module.info().stream.0)));
+                    environment.insert("object".into(), module.module_name().into_owned());
+                    break;
+                }
+            }
+        }
+        let Some(module_file_path) = module_file_path else { return Ok(None); };
 
         let Some(Component::Normal(_)) = module_file_path.components().last() else {
             return Ok(None);
@@ -1428,9 +1501,21 @@ impl Decompiler {
         let module_key = module_file_path.to_string_lossy().to_lowercase();
         let module = self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(module_file_path.clone()))));
         
-        for file in line_program.files().collect::<Vec<_>>()? {
-            let mut file_path = PathBuf::from(crate::utils::sanitize_path(&file.name.to_string_lossy(context.string_table.unwrap())?));
-
+        if !environment.is_empty() {
+            let mut module = module.borrow_mut();
+            if let Some(compiler) = environment.get("cl") {
+                module.compiler_path = crate::utils::canonicalize_path(&cwd, compiler, false);
+            }
+            if let Some(pdb) = environment.get("pdb") {
+                module.pdb_path = crate::utils::canonicalize_path(&cwd, pdb, false);
+            }
+            // Preserve flags verbatim: Xbox switches are not the desktop MSVC grammar.
+            for (key, value) in &environment {
+                let comment = cpp::ModuleMember::Comment(format!("Build {key}: {value}").replace("*/", "* /"));
+                if !module.members.contains(&comment) { module.members.push(comment); }
+            }
+        }
+        for mut file_path in source_files {
             // Skip the source file of the module
             if file_path.file_name().as_ref().map(|f| f.to_ascii_lowercase()) == module_file_path.file_name().as_ref().map(|f| f.to_ascii_lowercase()) {
                 continue;
@@ -1593,7 +1678,7 @@ impl Decompiler {
                 }
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.unwrap())?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -1688,7 +1773,7 @@ impl Decompiler {
                 }
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.unwrap())?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -1937,7 +2022,7 @@ impl Decompiler {
                 let address = self.options.base_address.unwrap_or(0) + rva.0 as u64;
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.unwrap())?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -2345,7 +2430,9 @@ impl Decompiler {
                 // Drop compiler-generated procedure definitions (implicit ctors/dtors/assignment,
                 // thunks, dynamic initializers): they have no source line and were never written
                 // in source. This matches dropping their declarations in `Class::add_member`.
-                if !self.options.include_compiler_generated {
+                // Legacy PDBs also omit lines for handwritten assembly and stripped
+                // objects, so missing line information is not evidence of generation.
+                if !self.options.include_compiler_generated && context.id_info.is_some() {
                     if procedure.line.is_none() {
                         return Ok(());
                     }
@@ -2407,7 +2494,7 @@ impl Decompiler {
                 }
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.unwrap())?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -2595,7 +2682,8 @@ impl Decompiler {
         symbols: &mut pdb2::SymbolIter,
         inline_site: &pdb2::InlineSiteSymbol,
     ) -> pdb2::Result<Vec<cpp::Statement>> {
-        let id_item = context.id_finder.find(inline_site.inlinee)?;
+        let id_finder = context.id_finder.as_ref().ok_or(pdb2::Error::StreamNotFound(4))?;
+        let id_item = id_finder.find(inline_site.inlinee)?;
         let id_data = id_item.parse()?;
         
         let name = match id_data {

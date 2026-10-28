@@ -49,3 +49,46 @@ cargo run --release -- --out=/path/to/out/ --pdb=/path/to/file.pdb --base-addres
 ## Contributing
 
 Any assistance or valid criticism would be appreciated. Please feel free to have a look at some of the open [issues](https://github.com/camden-smallwood/pdb-decompiler/issues), especially those tagged with [help wanted](https://github.com/camden-smallwood/pdb-decompiler/issues?q=is%3Aissue+is%3Aopen+label%3A"help+wanted").
+
+## Legacy Xbox 360 PDBs (XDK 9328)
+
+Pre-IPI PDBs are detected from the PDB information stream's feature signatures.
+Stream 4 can contain `/names` in these files; it must not be parsed as IPI.
+The legacy path recovers:
+
+- Class, union, enum, and function types from TPI. With `--export-cpp`, types
+  without declaration-file metadata and global typedefs are written to `exported.h`.
+- Module source paths and build metadata from `S_COMPILE2` command blocks or
+  `S_ENVBLOCK`, with DBI source-file lists and line records as fallbacks.
+- Aligned C13 source-line records from XDK MASM modules.
+- Procedure names, addresses, parameters, locals, module typedefs, and data from
+  module/global symbols using the existing C++ and IDA exporters.
+- Original build environment strings, including Xbox compiler switches, as
+  `Build ...` comments. These switches are preserved rather than interpreted
+  using the desktop compiler's argument grammar.
+
+Modules with useful symbols but no identifiable source file are preserved under
+`__pdb_modules/module_<stream>.cpp`. Source filters still apply to these paths.
+`exported.h` is a shared type inventory and is not limited by source filters.
+Legacy procedures without source lines are retained: lack of line information
+alone cannot distinguish handwritten assembly or stripped objects from
+compiler-generated functions.
+
+A PDB cannot supply information the compiler never emitted. In particular,
+legacy records do not necessarily identify a type's original header/line or
+individual inline call sites. Forward-only types remain declarations. Function
+bodies remain debug-scope stubs unless pseudocode is supplied through the IDA
+workflow; this tool does not reconstruct machine-code behavior by itself.
+
+Run unit tests with `cargo test`. A generated fixture test exercises the installed
+XDK compiler and linker without redistributing SDK files:
+
+```powershell
+$env:XDK_9328_ROOT = 'D:\Documents\Reverse Engineering\SDKS\XDK\9328'
+cargo test --test xdk9328 -- --ignored
+```
+
+The test deliberately gives the object a different filename from its source and
+checks recovered types, build metadata, symbols, scope variables, and repeatable
+shared-header output. It also removes `/names` and the build source key from a
+generated copy to verify the DBI-only source lookup.

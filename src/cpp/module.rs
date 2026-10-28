@@ -561,7 +561,7 @@ impl Module {
                         _ => None
                     },
                     is_union: matches!(data, pdb2::TypeData::Union(_)),
-                    is_declaration: false,
+                    is_declaration: properties.forward_reference(),
                     name: name.to_string().to_string(),
                     index: type_index,
                     depth: 0,
@@ -624,7 +624,7 @@ impl Module {
             Ok(pdb2::TypeData::Enumeration(data)) => {
                 if data.properties.forward_reference() {
                     // println!("WARNING: Skipping forward reference in toplevel: \"{}\" in \"{}\"", data.name, self.path.display());
-                    return Ok(());
+                    // Preserve the declaration when no complete definition is available.
                 }
 
                 let underlying_type_name = match cpp::type_name(
