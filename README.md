@@ -16,6 +16,25 @@ This tool is a work in progress and will most likely crash, have duplicate outpu
 cargo run --release -- --out=/path/to/out/ --pdb=/path/to/file.pdb --base-address=0x180000000 > file.pdb.log
 ```
 
+### Windows
+
+The tool follows the standard Windows command-line quoting rules, so quoted
+paths are fine. The one thing to avoid is a backslash immediately before a
+closing double quote: `\"` is treated as a literal quote rather than the end of
+the quoted string, which breaks argument parsing (typically reported as
+`PDB path not provided`).
+
+```
+:: OK
+pdb-decompiler.exe --out=F:\SINS_TEST --pdb=F:\SINS\Sins.pdb --base-address=0x180000000
+
+:: OK (quoted)
+pdb-decompiler.exe --out="F:\SINS_TEST" --pdb="F:\SINS\Sins.pdb" --base-address=0x180000000
+
+:: WRONG - the trailing \" escapes the closing quote and swallows the next flag
+pdb-decompiler.exe --out="F:\SINS_TEST\" --pdb="F:\SINS\Sins.pdb" --base-address=0x180000000
+```
+
 ### Flags
 
 | Short | Long | Description |

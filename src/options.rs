@@ -12,7 +12,7 @@ pub struct Options {
     pub out: Option<PathBuf>,
 
     /// The file path to the MSVC PDB file to decompile.
-    #[structopt(short, long)]
+    #[structopt(short, long, parse(from_os_str))]
     pub pdb: Option<PathBuf>,
 
     /// A source file path (or directory) to filter which modules are decompiled.
@@ -55,7 +55,7 @@ pub struct Options {
     pub export_debug_blocks_json: Option<PathBuf>,
 
     /// The file containing all function pseudocode in a JSON mapping. (Optional)
-    #[structopt(long)]
+    #[structopt(long, parse(from_os_str))]
     pub pseudocode_json_path: Option<PathBuf>,
 
     /// The loaded JSON value containing the mapping with all function pseudocode.
@@ -66,11 +66,11 @@ pub struct Options {
     pub unroll_functions: bool,
 
     /// The file path to the MSVC PDB file to decompile for extra function scope information.
-    #[structopt(long)]
+    #[structopt(long, parse(from_os_str))]
     pub function_scopes_pdb: Option<PathBuf>,
 
     /// The output directory to dump all function scopes C++ code to.
-    #[structopt(long)]
+    #[structopt(long, parse(from_os_str))]
     pub function_scopes_out: Option<PathBuf>,
 
     /// Whether to reorganize generated C++ code to Bungie's coding standards. (Experimental)
