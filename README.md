@@ -76,8 +76,10 @@ Stream 4 can contain `/names` in these files; it must not be parsed as IPI.
 The legacy path is selected by file capabilities, not compiler brand or target
 architecture. It covers desktop MSVC as well as Xbox 360 XDK PDBs and recovers:
 
-- Class, union, enum, and function types from TPI. With `--export-cpp`, types
-  without declaration-file metadata and global typedefs are written to `exported.h`.
+- Class, union, enum, and function types from TPI. Legacy PDBs record no
+  declaration file for a type, so with `--export-cpp` each type is placed in the
+  file the evidence points to (see below). The rest, forward-only types, and global
+  typedefs are written to `exported.h`.
 - Module source paths and build metadata from `S_COMPILE2` command blocks or
   `S_ENVBLOCK`, with DBI source-file lists and line records as fallbacks.
 - C11 source-line tables with local filenames, plus aligned C13 subsections
@@ -88,16 +90,36 @@ architecture. It covers desktop MSVC as well as Xbox 360 XDK PDBs and recovers:
   `Build ...` comments. These switches are preserved rather than interpreted
   using the desktop compiler's argument grammar.
 
+### Type placement
+
+A type is placed by the strongest evidence available:
+
+1. the header holding line records of its member functions, since an in-class body is
+   inside the class;
+2. a known header named after the source file that defines its member functions;
+3. the file of the type it is nested in, or of the only types holding it by value;
+4. the only file whose code (locals, parameters, globals) uses it.
+
+Nested types go with their outermost type and function-local types with their
+function. Anonymous types and types without evidence stay in `exported.h`.
+`placements.json` lists every placed type with its file, the rule that placed it
+and the evidence, so an inferred location can be checked; it is not an original
+header location unless the evidence says so.
+
 Modules with useful symbols but no identifiable source file are preserved under
 `__pdb_modules/module_<stream>.cpp`. Source filters still apply to these paths.
-`exported.h` is a shared type inventory and is not limited by source filters.
+`exported.h` is a shared type inventory and is not limited by source filters: a
+type whose inferred file is filtered out stays there. Headers known only from line
+records or file lists, where nothing could be recovered, are not written; their
+paths are listed in `empty_headers.txt`, relative to the output directory.
 Legacy procedures without source lines are retained: lack of line information
 alone cannot distinguish handwritten assembly or stripped objects from
 compiler-generated functions.
 
 A PDB cannot supply information the compiler never emitted. In particular,
-legacy records do not necessarily identify a type's original header/line or
-individual inline call sites. Forward-only types remain declarations. Function
+legacy records do not identify a type's original header/line (placement infers
+one) or individual inline call sites. A header that held only declarations
+appears nowhere in a legacy PDB, so its types cannot be placed in it. Forward-only types remain declarations. Function
 bodies remain debug-scope stubs unless pseudocode is supplied through the IDA
 workflow; this tool does not reconstruct machine-code behavior by itself.
 

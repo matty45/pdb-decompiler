@@ -5,6 +5,7 @@ mod namespaces;
 mod legacy;
 mod options;
 mod param_const;
+mod placement;
 mod reorganize;
 mod tabbed;
 pub mod utils;

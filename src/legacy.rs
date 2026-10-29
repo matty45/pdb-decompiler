@@ -1,11 +1,20 @@
 //! Metadata shared by pre-IPI and modern PDBs. Stream 4 is not reserved in old PDBs.
 
+use pdb2::FallibleIterator;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 pub type LineOffsets =
     HashMap<pdb2::StringRef, HashMap<pdb2::PdbInternalSectionOffset, pdb2::LineInfo>>;
 pub type SourceLines = HashMap<String, HashMap<pdb2::PdbInternalSectionOffset, pdb2::LineInfo>>;
+
+/// The line record at `offset`. Identical-code folding can give several files a record at the
+/// same offset; the smallest file name wins so that output does not vary between runs.
+pub fn line_at(lines: &SourceLines, offset: pdb2::PdbInternalSectionOffset) -> Option<(&String, &pdb2::LineInfo)> {
+    lines.iter()
+        .filter_map(|(file, offsets)| Some((file, offsets.get(&offset)?)))
+        .min_by_key(|(file, _)| *file)
+}
 
 /// C11 stores file offsets, per-file segment ranges, then offset/line arrays.
 /// Unlike C13, filenames are local to this table, independent of `/names`.
@@ -167,6 +176,35 @@ pub fn c13_lines(bytes: &[u8]) -> pdb2::Result<LineOffsets> {
         }
     }
     Ok(result)
+}
+
+/// A module's line records by file name: C11 tables when present, otherwise C13 subsections.
+pub fn module_source_lines(
+    pdb: &mut pdb2::PDB<'_, std::fs::File>,
+    module: &pdb2::Module,
+    line_program: Option<&pdb2::LineProgram>,
+    strings: Option<&pdb2::StringTable>,
+) -> pdb2::Result<SourceLines> {
+    let info = module.info();
+    let start = info.symbols_size as usize;
+    if info.lines_size > 0 {
+        let stream = pdb.raw_stream(info.stream)?.ok_or(pdb2::Error::StreamNotFound(info.stream.0 as u32))?;
+        return c11_lines(stream.as_slice().get(start..start + info.lines_size as usize).ok_or(pdb2::Error::UnexpectedEof)?, false);
+    }
+    let Some(strings) = strings else { return Ok(SourceLines::new()) };
+    if let Some(program) = line_program {
+        let mut result = SourceLines::new();
+        for line in program.lines().collect::<Vec<_>>()? {
+            let file = program.get_file_info(line.file_index)?;
+            result.entry(file.name.to_string_lossy(strings)?.into_owned()).or_default().entry(line.offset).or_insert(line);
+        }
+        return Ok(result);
+    }
+    let stream = pdb.raw_stream(info.stream)?.ok_or(pdb2::Error::StreamNotFound(info.stream.0 as u32))?;
+    c13_lines(stream.as_slice().get(start..start + info.c13_lines_size as usize).ok_or(pdb2::Error::UnexpectedEof)?)?
+        .into_iter()
+        .map(|(name, lines)| Ok((name.to_string_lossy(strings)?.into_owned(), lines)))
+        .collect()
 }
 
 /// `pdb2` parses the fixed COMPILE2 fields but omits its trailing command block.

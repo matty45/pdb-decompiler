@@ -417,15 +417,57 @@ impl Decompiler {
             }
         }
 
+        let mut canonical_type_indices = vec![];
         for type_index in exported_type_indices {
             if let Some(name) = context.type_finder.find(type_index)?.parse()?.name() {
                 if self.canonical_type_index.get(name.to_string().as_ref())
                     .is_some_and(|canonical| *canonical != type_index) { continue; }
             }
-            if let Err(e) = module.add_type_definition(&mut self.class_table, &mut self.type_sizes, &mut self.type_names, context.machine_type, &context.type_info, &context.type_finder, type_index, 0) {
+            canonical_type_indices.push(type_index);
+        }
+
+        // Without IPI no type records its declaration file; infer one where the evidence allows
+        let placements = crate::placement::place_types(context, &canonical_type_indices)?;
+        let mut placement_entries = vec![];
+
+        for type_index in canonical_type_indices {
+            // A type whose file is filtered out stays in the shared inventory
+            let placed = placements.get(&type_index).and_then(|placement| {
+                let path = PathBuf::from(crate::utils::sanitize_path(&placement.file));
+                Self::rebase_output_path(&self.options.source_paths, &path).map(|_| (path, placement))
+            });
+
+            let Some((path, placement)) = placed else {
+                if let Err(e) = module.add_type_definition(&mut self.class_table, &mut self.type_sizes, &mut self.type_names, context.machine_type, &context.type_info, &context.type_finder, type_index, 0) {
+                    panic!("{e}");
+                }
+                continue;
+            };
+
+            let target = self.modules.entry(path.to_string_lossy().to_lowercase())
+                .or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path.clone()))))
+                .clone();
+
+            if let Err(e) = target.borrow_mut().add_type_definition(&mut self.class_table, &mut self.type_sizes, &mut self.type_names, context.machine_type, &context.type_info, &context.type_finder, type_index, placement.line) {
                 panic!("{e}");
             }
+
+            let name = context.type_finder.find(type_index)?.parse()?.name().map(|n| n.to_string().into_owned()).unwrap_or_default();
+            placement_entries.push((placement.file.clone(), placement.line, name, type_index, placement.rule, placement.evidence.clone()));
         }
+
+        placement_entries.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
+
+        let placement_index = serde_json::json!({
+            "note": "Inferred declaration files for types in a PDB without IPI, which records none. Types not listed are in exported.h.",
+            "types": placement_entries.iter().map(|(file, _, name, type_index, rule, evidence)| serde_json::json!({
+                "type": name,
+                "type_index": format!("0x{:X}", type_index.0),
+                "file": file,
+                "rule": rule,
+                "evidence": evidence,
+            })).collect::<Vec<_>>(),
+        });
 
         let module = Rc::new(RefCell::new(module));
         let mut symbols = context.global_symbols.iter();
@@ -445,6 +487,9 @@ impl Decompiler {
         if let Err(e) = write!(file, "{}", cpp::compact_std_templates(&cpp::shorten_std_aliases(&module.borrow().to_string()))) {
             panic!("{e}");
         }
+
+        let index_file = File::create(exported_path.with_file_name("placements.json")).map_err(pdb2::Error::IoError)?;
+        serde_json::to_writer_pretty(index_file, &placement_index).map_err(|e| pdb2::Error::IoError(e.into()))?;
 
         Ok(())
     }
@@ -837,7 +882,7 @@ impl Decompiler {
             for i in 0..module.members.len() {
                 match &module.members[i] {
                     cpp::ModuleMember::Class(class_data) => {
-                        Self::fix_nested_types(module.members.as_slice(), i, class_data.clone(), &mut remove_class_names, &mut remove_enum_names);
+                        Self::fix_nested_types(module.members.as_slice(), i, class_data.clone(), None, &mut remove_class_names, &mut remove_enum_names);
                         new_members.push(cpp::ModuleMember::Class(class_data.clone()));
                     }
 
@@ -867,6 +912,17 @@ impl Decompiler {
                 }
             }
             
+            // A nested type defined inside its parent here is redundant at the top level. One whose
+            // parent is elsewhere, or that its parent records under another name (a member template
+            // such as `?$rebind@D`), keeps its top-level definition, as it is the only one.
+            let mut nested_definitions = HashSet::new();
+
+            for member in module.members.iter() {
+                if let cpp::ModuleMember::Class(class_data) = member {
+                    Self::collect_nested_definitions(&class_data.borrow(), &mut nested_definitions);
+                }
+            }
+
             for i in (0..module.members.len()).rev() {
                 match &module.members[i] {
                     cpp::ModuleMember::Class(class_data) => {
@@ -875,7 +931,8 @@ impl Decompiler {
                             // Anonymous types are inlined into their parent field, so drop
                             // the redundant top-level definition too.
                             cpp::is_anonymous_type_name(&class_data.name)
-                                || class_data.properties.as_ref().map(|p| p.is_nested_type()).unwrap_or(false)
+                                || (class_data.properties.as_ref().map(|p| p.is_nested_type()).unwrap_or(false)
+                                    && nested_definitions.contains(&class_data.index))
                         };
 
                         if is_nested_type {
@@ -892,7 +949,9 @@ impl Decompiler {
                     }
                     
                     cpp::ModuleMember::Enum(enum_data) => {
-                        if cpp::is_anonymous_type_name(&enum_data.name) || enum_data.properties.is_nested_type() {
+                        if cpp::is_anonymous_type_name(&enum_data.name)
+                            || (enum_data.properties.is_nested_type() && nested_definitions.contains(&enum_data.index))
+                        {
                             // println!("WARNING: Removing unreferenced nested enum in toplevel: \"{}\" in \"{}\"", enum_data.name, module.path.display());
                             module.members.remove(i);
                         }
@@ -1031,6 +1090,7 @@ impl Decompiler {
         };
 
         let source_paths = &self.options.source_paths;
+        let mut empty_headers = vec![];
 
         for module in self.modules.values_mut() {
             // Compute the rebased output path (skip modules that don't match a filter).
@@ -1044,6 +1104,13 @@ impl Decompiler {
             };
 
             let mut module = module.borrow_mut();
+
+            // A header known only from line records may have nothing recoverable. Its path still
+            // records the original source tree, so list it instead of writing it out empty
+            if module.is_header() && module.headers.is_empty() && module.members.iter().all(|m| matches!(m, cpp::ModuleMember::EmptyLine | cpp::ModuleMember::Preprocessor(_))) {
+                empty_headers.push(rebased_path.to_string_lossy().trim_start_matches(['/', '\\']).to_string());
+                continue;
+            }
 
             let mut path = PathBuf::new();
             
@@ -1116,6 +1183,17 @@ impl Decompiler {
                     panic!("Failed to write to file: \"{}\" - {e}", path.display());
                 }
             }
+        }
+
+        //
+        // List the headers that were not written, one output-relative path per line
+        //
+
+        if self.options.export_cpp && !empty_headers.is_empty() {
+            empty_headers.sort_by_key(|path| path.to_lowercase());
+            empty_headers.dedup_by_key(|path| path.to_lowercase());
+            std::fs::create_dir_all(out_path)?;
+            std::fs::write(out_path.join("empty_headers.txt"), empty_headers.join("\n") + "\n")?;
         }
 
         //
@@ -1286,25 +1364,7 @@ impl Decompiler {
         };
 
         let line_program = module_info.line_program();
-        let line_offsets = if pdb_module.info().lines_size > 0 {
-            let stream = context.pdb.raw_stream(pdb_module.info().stream)?
-                .ok_or(pdb2::Error::StreamNotFound(pdb_module.info().stream.0 as u32))?;
-            let start = pdb_module.info().symbols_size as usize;
-            let end = start + pdb_module.info().lines_size as usize;
-            crate::legacy::c11_lines(stream.as_slice().get(start..end).ok_or(pdb2::Error::UnexpectedEof)?, false)?
-        } else if let Some(strings) = context.string_table {
-            if let Ok(program) = &line_program {
-                self.get_module_line_program_offsets(program, strings)?
-            } else {
-                let stream = context.pdb.raw_stream(pdb_module.info().stream)?
-                    .ok_or(pdb2::Error::StreamNotFound(pdb_module.info().stream.0 as u32))?;
-                let start = pdb_module.info().symbols_size as usize;
-                let end = start + pdb_module.info().c13_lines_size as usize;
-                crate::legacy::c13_lines(stream.as_slice().get(start..end).ok_or(pdb2::Error::UnexpectedEof)?)?
-                    .into_iter().map(|(name, lines)| Ok((name.to_string_lossy(strings)?.into_owned(), lines)))
-                    .collect::<pdb2::Result<crate::legacy::SourceLines>>()?
-            }
-        } else { HashMap::new() };
+        let line_offsets = crate::legacy::module_source_lines(context.pdb, pdb_module, line_program.as_ref().ok(), context.string_table)?;
 
         let Some(module) = self.get_or_create_cpp_module(
             context,
@@ -1399,24 +1459,6 @@ impl Decompiler {
         }
 
         Ok(obj_path)
-    }
-
-    #[inline(always)]
-    fn get_module_line_program_offsets(
-        &mut self,
-        line_program: &pdb2::LineProgram,
-        strings: &pdb2::StringTable,
-    ) -> pdb2::Result<crate::legacy::SourceLines> {
-        let mut line_offsets = HashMap::new();
-
-        for line in line_program.lines().collect::<Vec<_>>()? {
-            let file = line_program.get_file_info(line.file_index)?;
-            let offsets = line_offsets.entry(file.name.to_string_lossy(strings)?.into_owned()).or_insert_with(HashMap::new);
-
-            offsets.entry(line.offset).or_insert(line);
-        }
-
-        Ok(line_offsets)
     }
 
     #[inline(always)]
@@ -1536,7 +1578,12 @@ impl Decompiler {
                 continue;
             }
 
-            if file_path.file_stem().as_ref().map(|f| f.to_ascii_lowercase()) == module_file_path.file_stem().as_ref().map(|f| f.to_ascii_lowercase()) {
+            // Prefer the module's casing for its own header, which must sit in the same directory
+            let same_directory = file_path.parent().zip(module_file_path.parent()).is_some_and(|(a, b)| {
+                crate::utils::sanitize_path(a.to_string_lossy()).eq_ignore_ascii_case(&crate::utils::sanitize_path(b.to_string_lossy()))
+            });
+
+            if same_directory && file_path.file_stem().as_ref().map(|f| f.to_ascii_lowercase()) == module_file_path.file_stem().as_ref().map(|f| f.to_ascii_lowercase()) {
                 let extension = file_path.extension().as_ref().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| String::new());
                 file_path = module_file_path.with_extension(extension);
             }
@@ -1681,16 +1728,9 @@ impl Decompiler {
             }
 
             pdb2::SymbolData::Data(data_symbol) => {
-                let mut file_name_ref = None;
-                let mut line_info = None;
-
-                for (name_ref, offsets) in line_offsets.iter() {
-                    if let Some(line) = offsets.get(&data_symbol.offset) {
-                        file_name_ref = Some(name_ref);
-                        line_info = Some(line.clone());
-                        break;
-                    }
-                }
+                let found = crate::legacy::line_at(line_offsets, data_symbol.offset);
+                let file_name_ref = found.map(|(name_ref, _)| name_ref);
+                let line_info = found.map(|(_, line)| line.clone());
 
                 let module = if let Some(file_name_ref) = file_name_ref {
                     let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
@@ -1776,16 +1816,9 @@ impl Decompiler {
             }
 
             pdb2::SymbolData::ThreadStorage(thread_storage_symbol) => {
-                let mut file_name_ref = None;
-                let mut line_info = None;
-
-                for (name_ref, offsets) in line_offsets.iter() {
-                    if let Some(line) = offsets.get(&thread_storage_symbol.offset) {
-                        file_name_ref = Some(name_ref);
-                        line_info = Some(line.clone());
-                        break;
-                    }
-                }
+                let found = crate::legacy::line_at(line_offsets, thread_storage_symbol.offset);
+                let file_name_ref = found.map(|(name_ref, _)| name_ref);
+                let line_info = found.map(|(_, line)| line.clone());
 
                 let module = if let Some(file_name_ref) = file_name_ref {
                     let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
@@ -2015,16 +2048,9 @@ impl Decompiler {
                     data => todo!("{data:#?}")
                 };
 
-                let mut file_name_ref = None;
-                let mut line_info = None;
-
-                for (name_ref, offsets) in line_offsets.iter() {
-                    if let Some(line) = offsets.get(&procedure_symbol.offset) {
-                        file_name_ref = Some(name_ref);
-                        line_info = Some(line.clone());
-                        break;
-                    }
-                }
+                let found = crate::legacy::line_at(line_offsets, procedure_symbol.offset);
+                let file_name_ref = found.map(|(name_ref, _)| name_ref);
+                let line_info = found.map(|(_, line)| line.clone());
 
                 let rva = match procedure_symbol.offset.to_rva(context.address_map) {
                     Some(rva) => rva,
@@ -2497,16 +2523,7 @@ impl Decompiler {
             }
 
             pdb2::SymbolData::Public(public_symbol) => {
-                let mut file_name_ref = None;
-                // let mut line_info = None;
-
-                for (name_ref, offsets) in line_offsets.iter() {
-                    if let Some(_line) = offsets.get(&public_symbol.offset) {
-                        file_name_ref = Some(name_ref);
-                        // line_info = Some(line.clone());
-                        break;
-                    }
-                }
+                let file_name_ref = crate::legacy::line_at(line_offsets, public_symbol.offset).map(|(name_ref, _)| name_ref);
 
                 let module = if let Some(file_name_ref) = file_name_ref {
                     let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
@@ -3208,14 +3225,40 @@ impl Decompiler {
         }
     }
 
+    /// Adds the indices of nested types defined inside `class_data`, at any depth.
+    fn collect_nested_definitions(class_data: &cpp::Class, indices: &mut HashSet<pdb2::TypeIndex>) {
+        for member in class_data.members.iter() {
+            match member {
+                cpp::ClassMember::Class(nested) => {
+                    let nested = nested.borrow();
+
+                    if !nested.is_declaration && indices.insert(nested.index) {
+                        Self::collect_nested_definitions(&nested, indices);
+                    }
+                }
+
+                cpp::ClassMember::Enum(nested) if !nested.is_declaration => {
+                    indices.insert(nested.index);
+                }
+
+                _ => {}
+            }
+        }
+    }
+
     fn fix_nested_types(
         module_members: &[cpp::ModuleMember],
         module_member_index: usize,
         class_data: Rc<RefCell<cpp::Class>>,
+        scope: Option<&str>,
         remove_class_names: &mut Vec<String>,
         remove_enum_names: &mut Vec<String>,
     ) {
-        let class_name = class_data.borrow().name.clone();
+        // A nested class stores its own name only; qualify it to find its nested types' definitions
+        let class_name = match scope {
+            Some(scope) => format!("{scope}::{}", class_data.borrow().name),
+            None => class_data.borrow().name.clone(),
+        };
         let mut new_members = class_data.borrow_mut().members.clone();
 
         for class_member in new_members.iter_mut() {
@@ -3261,7 +3304,7 @@ impl Decompiler {
                         }
                     }
 
-                    Self::fix_nested_types(module_members, module_member_index, nested_class.clone(), remove_class_names, remove_enum_names);
+                    Self::fix_nested_types(module_members, module_member_index, nested_class.clone(), Some(&class_name), remove_class_names, remove_enum_names);
                     
                     if !remove_class_names.contains(&full_name) {
                         remove_class_names.push(full_name);
@@ -3325,7 +3368,7 @@ impl Decompiler {
                                     unreachable!()
                                 };
 
-                                Self::fix_nested_types(module_members, module_member_index, other_class.clone(), remove_class_names, remove_enum_names);
+                                Self::fix_nested_types(module_members, module_member_index, other_class.clone(), None, remove_class_names, remove_enum_names);
 
                                 let mut other_class = other_class.borrow().clone();
                                 other_class.name = String::new();

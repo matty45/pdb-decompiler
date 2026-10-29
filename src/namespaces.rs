@@ -141,7 +141,7 @@ fn is_local_scope_marker(component: &str) -> bool {
 /// function's qualified name (everything before the first marker) and the entity's own
 /// name (everything after the last marker — intervening nested-block markers are dropped).
 /// Returns `None` when the name has no such marker.
-fn split_local_scope(name: &str) -> Option<(String, String)> {
+pub fn split_local_scope(name: &str) -> Option<(String, String)> {
     let components = split_qualified(name);
     let first = components.iter().position(|c| is_local_scope_marker(c))?;
     let last = components.iter().rposition(|c| is_local_scope_marker(c)).unwrap();

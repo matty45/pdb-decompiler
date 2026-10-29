@@ -64,23 +64,28 @@ fn xdk9328_without_ipi() {
             ]))
     };
     invoke();
+    // Only legacy.cpp's code uses Sample, so it is placed there, as declared. Mode was emitted
+    // only as a forward reference, which stays in the shared inventory.
     let types = std::fs::read_to_string(work.join("output/exported.h")).unwrap();
-    assert_eq!(types.matches("struct Sample").count(), 1, "{types}");
-    assert!(types.contains("__int32 value"), "{types}");
-    assert!(types.contains("enum Mode"), "{types}");
+    assert!(!types.contains("struct Sample"), "{types}");
+    assert!(types.contains("enum Mode;"), "{types}");
     assert!(
         types.contains("typedef unsigned long LegacyWord"),
         "{types}"
     );
+    let placements = std::fs::read_to_string(work.join("output/placements.json")).unwrap();
+    assert!(placements.contains("\"type\": \"Sample\""), "{placements}");
     let source = std::fs::read_to_string(
         work.join("output")
             .join(work.file_name().unwrap())
             .join("legacy.cpp"),
     )
     .unwrap();
+    assert_eq!(source.matches("struct Sample").count(), 1, "{source}");
     for expected in [
         "Build cmd:",
         "Build src: legacy.cpp",
+        "__int32 value",
         "Sample::add(__int32 amount)",
         "global_count",
         "__int32 local",
