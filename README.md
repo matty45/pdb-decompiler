@@ -50,20 +50,22 @@ cargo run --release -- --out=/path/to/out/ --pdb=/path/to/file.pdb --base-addres
 
 Any assistance or valid criticism would be appreciated. Please feel free to have a look at some of the open [issues](https://github.com/camden-smallwood/pdb-decompiler/issues), especially those tagged with [help wanted](https://github.com/camden-smallwood/pdb-decompiler/issues?q=is%3Aissue+is%3Aopen+label%3A"help+wanted").
 
-## Legacy Xbox 360 PDBs (XDK 9328)
+## Legacy MSVC PDBs (without IPI)
 
 Pre-IPI PDBs are detected from the PDB information stream's feature signatures.
 Stream 4 can contain `/names` in these files; it must not be parsed as IPI.
-The legacy path recovers:
+The legacy path is selected by file capabilities, not compiler brand or target
+architecture. It covers desktop MSVC as well as Xbox 360 XDK PDBs and recovers:
 
 - Class, union, enum, and function types from TPI. With `--export-cpp`, types
   without declaration-file metadata and global typedefs are written to `exported.h`.
 - Module source paths and build metadata from `S_COMPILE2` command blocks or
   `S_ENVBLOCK`, with DBI source-file lists and line records as fallbacks.
-- Aligned C13 source-line records from XDK MASM modules.
+- C11 source-line tables with local filenames, plus aligned C13 subsections
+  used by assemblers and other CodeView producers.
 - Procedure names, addresses, parameters, locals, module typedefs, and data from
   module/global symbols using the existing C++ and IDA exporters.
-- Original build environment strings, including Xbox compiler switches, as
+- Original build environment strings, including historical and target-specific compiler switches, as
   `Build ...` comments. These switches are preserved rather than interpreted
   using the desktop compiler's argument grammar.
 
@@ -92,3 +94,19 @@ The test deliberately gives the object a different filename from its source and
 checks recovered types, build metadata, symbols, scope variables, and repeatable
 shared-header output. It also removes `/names` and the build source key from a
 generated copy to verify the DBI-only source lookup.
+
+Inspect a PDB before exporting with:
+
+```text
+cargo run --example pdb_inventory -- path/to/input.pdb
+```
+
+This reports the target architecture, IPI availability, compiler versions, and
+C11 coverage and top-level symbol kinds. C11 line recovery has also been checked against a desktop x86
+PDB produced by MSVC 7.x; the XDK integration test is one compatibility case,
+not a restriction on supported input.
+
+The C11 layout uses per-file segment tables and parallel address/line arrays;
+see the [Wine CodeView reader](https://github.com/wine-mirror/wine/blob/master/dlls/dbghelp/msc.c)
+for another implementation of this format. Files from older MSF 2.0/VC6 or
+16-bit CodeView dialects are not covered by the current integration tests.

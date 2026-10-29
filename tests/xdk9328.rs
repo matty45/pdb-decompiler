@@ -89,6 +89,7 @@ fn xdk9328_without_ipi() {
     }
     let scopes = std::fs::read_to_string(work.join("scopes.json")).unwrap();
     assert!(scopes.contains("__int32 local"), "{scopes}");
+    assert!(scopes.contains("__int32 nested"), "{scopes}");
     invoke();
     assert_eq!(
         types,

@@ -5,6 +5,75 @@ use std::collections::HashMap;
 
 pub type LineOffsets =
     HashMap<pdb2::StringRef, HashMap<pdb2::PdbInternalSectionOffset, pdb2::LineInfo>>;
+pub type SourceLines = HashMap<String, HashMap<pdb2::PdbInternalSectionOffset, pdb2::LineInfo>>;
+
+/// C11 stores file offsets, per-file segment ranges, then offset/line arrays.
+/// Unlike C13, filenames are local to this table, independent of `/names`.
+pub fn c11_lines(bytes: &[u8], pascal_names: bool) -> pdb2::Result<SourceLines> {
+    let word = |offset| -> pdb2::Result<u16> {
+        let value = bytes
+            .get(offset..offset + 2)
+            .ok_or(pdb2::Error::UnexpectedEof)?;
+        Ok(u16::from_le_bytes(value.try_into().unwrap()))
+    };
+    let files = word(0)? as usize;
+    let segments = word(2)? as usize;
+    bytes
+        .get(..4 + files * 4 + segments * 10)
+        .ok_or(pdb2::Error::UnexpectedEof)?;
+    let mut result = SourceLines::new();
+    for file in 0..files {
+        let base = u32_at(bytes, 4 + file * 4)? as usize;
+        let count = word(base)? as usize;
+        let ranges = base + 4 + count * 4;
+        let name_start = ranges + count * 8;
+        let tail = bytes.get(name_start..).ok_or(pdb2::Error::UnexpectedEof)?;
+        let name = if pascal_names {
+            let len = *tail.first().ok_or(pdb2::Error::UnexpectedEof)? as usize;
+            tail.get(1..1 + len).ok_or(pdb2::Error::UnexpectedEof)?
+        } else {
+            let len = tail
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or(pdb2::Error::UnexpectedEof)?;
+            &tail[..len]
+        };
+        let offsets = result
+            .entry(String::from_utf8_lossy(name).into_owned())
+            .or_default();
+        for segment in 0..count {
+            let table = u32_at(bytes, base + 4 + segment * 4)? as usize;
+            let section = word(table)?;
+            let lines = word(table + 2)? as usize;
+            let numbers = table + 4 + lines * 4;
+            bytes
+                .get(numbers..numbers + lines * 2)
+                .ok_or(pdb2::Error::UnexpectedEof)?;
+            let end = u32_at(bytes, ranges + segment * 8 + 4)?;
+            for i in 0..lines {
+                let offset = u32_at(bytes, table + 4 + i * 4)?;
+                let next = if i + 1 < lines {
+                    Some(u32_at(bytes, table + 8 + i * 4)?)
+                } else {
+                    end.checked_add(1)
+                };
+                let key = pdb2::PdbInternalSectionOffset { section, offset };
+                let line = word(numbers + i * 2)? as u32;
+                offsets.entry(key).or_insert(pdb2::LineInfo {
+                    offset: key,
+                    length: next.and_then(|next| next.checked_sub(offset)),
+                    file_index: pdb2::FileIndex(file as u32),
+                    line_start: line,
+                    line_end: line,
+                    column_start: None,
+                    column_end: None,
+                    kind: pdb2::LineInfoKind::Statement,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
 
 /// XDK MASM keeps a local string subsection whose size excludes alignment padding.
 /// The current pdb2 subsection iterator does not skip that padding.
@@ -214,6 +283,43 @@ pub fn source_files(bytes: &[u8]) -> pdb2::Result<Vec<Vec<String>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c11_local_filenames_offsets_and_line_numbers() {
+        for pascal in [false, true] {
+            let mut bytes = vec![0; 64];
+            bytes[0..2].copy_from_slice(&1u16.to_le_bytes());
+            bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
+            bytes[4..8].copy_from_slice(&20u32.to_le_bytes());
+            bytes[8..12].copy_from_slice(&0x100u32.to_le_bytes());
+            bytes[12..16].copy_from_slice(&0x10fu32.to_le_bytes());
+            bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+            bytes[20..22].copy_from_slice(&1u16.to_le_bytes());
+            bytes[24..28].copy_from_slice(&48u32.to_le_bytes());
+            bytes[28..32].copy_from_slice(&0x100u32.to_le_bytes());
+            bytes[32..36].copy_from_slice(&0x10fu32.to_le_bytes());
+            bytes[36..45].copy_from_slice(if pascal {
+                b"\x08test.cpp"
+            } else {
+                b"test.cpp\0"
+            });
+            bytes[48..50].copy_from_slice(&3u16.to_le_bytes());
+            bytes[50..52].copy_from_slice(&2u16.to_le_bytes());
+            bytes[52..56].copy_from_slice(&0x100u32.to_le_bytes());
+            bytes[56..60].copy_from_slice(&0x108u32.to_le_bytes());
+            bytes[60..62].copy_from_slice(&10u16.to_le_bytes());
+            bytes[62..64].copy_from_slice(&20u16.to_le_bytes());
+            let lines = c11_lines(&bytes, pascal).unwrap();
+            let line = &lines["test.cpp"][&pdb2::PdbInternalSectionOffset {
+                section: 3,
+                offset: 0x108,
+            }];
+            assert_eq!(line.line_start, 20);
+            assert_eq!(line.length, Some(8));
+            bytes.pop();
+            assert!(c11_lines(&bytes, pascal).is_err());
+        }
+    }
 
     #[test]
     fn masm_c13_skips_string_subsection_padding() {

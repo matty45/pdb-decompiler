@@ -1133,7 +1133,7 @@ impl Decompiler {
     fn load_module_global_symbols<'a, 's>(
         &mut self,
         context: &mut DecompileContext<'a, 's>
-    ) -> Result<HashMap<String, Vec<pdb2::SymbolData<'a>>>, Box<dyn Error>> {
+    ) -> Result<HashMap<u16, Vec<pdb2::SymbolData<'a>>>, Box<dyn Error>> {
         // println!("Loading module global symbols...");
 
         let mut section_contributions = vec![];
@@ -1219,7 +1219,7 @@ impl Decompiler {
                 pdb2::SymbolData::ProcedureReference(pdb2::ProcedureReferenceSymbol { module: Some(module), .. }) => {
                     let referenced_module = modules.get(module as usize).unwrap();
 
-                    let module_name = referenced_module.module_name().to_string();
+                    let module_name = referenced_module.info().stream.0;
                     prev_module_name = Some(module_name.clone());
 
                     // println!(
@@ -1238,7 +1238,7 @@ impl Decompiler {
                         let contributing_module = modules.get(contribution.module as usize).unwrap();
 
                         if offset >= contribution.offset && offset < contribution.offset + contribution.size {
-                            let module_name = contributing_module.module_name().to_string();
+                            let module_name = contributing_module.info().stream.0;
                             prev_module_name = Some(module_name.clone());
 
                             // println!(
@@ -1275,7 +1275,7 @@ impl Decompiler {
         &mut self,
         context: &mut DecompileContext<'a, 's>,
         pdb_module: &pdb2::Module,
-        module_global_symbols: &HashMap<String, Vec<pdb2::SymbolData>>,
+        module_global_symbols: &HashMap<u16, Vec<pdb2::SymbolData>>,
     ) -> Result<(), Box<dyn Error>> {
         let module_info = match context.pdb.module_info(pdb_module)? {
             Some(module_info) => module_info,
@@ -1286,26 +1286,33 @@ impl Decompiler {
         };
 
         let line_program = module_info.line_program();
-        let line_offsets = if context.string_table.is_none() {
-            HashMap::new()
-        } else if let Ok(program) = &line_program {
-            self.get_module_line_program_offsets(program)?
-        } else if context.id_info.is_none() && pdb_module.info().c13_lines_size > 0 {
+        let line_offsets = if pdb_module.info().lines_size > 0 {
             let stream = context.pdb.raw_stream(pdb_module.info().stream)?
                 .ok_or(pdb2::Error::StreamNotFound(pdb_module.info().stream.0 as u32))?;
-            let start = pdb_module.info().symbols_size as usize + pdb_module.info().lines_size as usize;
-            let end = start + pdb_module.info().c13_lines_size as usize;
-            crate::legacy::c13_lines(stream.as_slice().get(start..end).ok_or(pdb2::Error::UnexpectedEof)?)?
-        } else {
-            return Err(line_program.err().unwrap().into());
-        };
-        
+            let start = pdb_module.info().symbols_size as usize;
+            let end = start + pdb_module.info().lines_size as usize;
+            crate::legacy::c11_lines(stream.as_slice().get(start..end).ok_or(pdb2::Error::UnexpectedEof)?, false)?
+        } else if let Some(strings) = context.string_table {
+            if let Ok(program) = &line_program {
+                self.get_module_line_program_offsets(program, strings)?
+            } else {
+                let stream = context.pdb.raw_stream(pdb_module.info().stream)?
+                    .ok_or(pdb2::Error::StreamNotFound(pdb_module.info().stream.0 as u32))?;
+                let start = pdb_module.info().symbols_size as usize;
+                let end = start + pdb_module.info().c13_lines_size as usize;
+                crate::legacy::c13_lines(stream.as_slice().get(start..end).ok_or(pdb2::Error::UnexpectedEof)?)?
+                    .into_iter().map(|(name, lines)| Ok((name.to_string_lossy(strings)?.into_owned(), lines)))
+                    .collect::<pdb2::Result<crate::legacy::SourceLines>>()?
+            }
+        } else { HashMap::new() };
+
         let Some(module) = self.get_or_create_cpp_module(
             context,
             pdb_module,
             &module_info,
             line_program.as_ref().ok(),
-            module_global_symbols.get(&pdb_module.module_name().to_string()).is_some_and(|symbols|
+            &line_offsets,
+            module_global_symbols.get(&pdb_module.info().stream.0).is_some_and(|symbols|
                 symbols.iter().any(|symbol| matches!(symbol, pdb2::SymbolData::Data(_)
                     | pdb2::SymbolData::ThreadStorage(_) | pdb2::SymbolData::Procedure(_)))),
         )? else {
@@ -1320,7 +1327,7 @@ impl Decompiler {
         // println!("Processing module: \"{}\"", module.borrow().path.display());
 
         // Process module global symbols
-        if let Some(global_symbols) = module_global_symbols.get(&pdb_module.module_name().to_string()).cloned() {
+        if let Some(global_symbols) = module_global_symbols.get(&pdb_module.info().stream.0).cloned() {
             for symbol_data in global_symbols {
                 self.process_module_symbol_data(
                     context,
@@ -1398,12 +1405,13 @@ impl Decompiler {
     fn get_module_line_program_offsets(
         &mut self,
         line_program: &pdb2::LineProgram,
-    ) -> pdb2::Result<HashMap<pdb2::StringRef, HashMap<pdb2::PdbInternalSectionOffset, pdb2::LineInfo>>> {
+        strings: &pdb2::StringTable,
+    ) -> pdb2::Result<crate::legacy::SourceLines> {
         let mut line_offsets = HashMap::new();
 
         for line in line_program.lines().collect::<Vec<_>>()? {
             let file = line_program.get_file_info(line.file_index)?;
-            let offsets = line_offsets.entry(file.name).or_insert_with(HashMap::new);
+            let offsets = line_offsets.entry(file.name.to_string_lossy(strings)?.into_owned()).or_insert_with(HashMap::new);
 
             offsets.entry(line.offset).or_insert(line);
         }
@@ -1418,6 +1426,7 @@ impl Decompiler {
         module: &pdb2::Module,
         module_info: &pdb2::ModuleInfo,
         line_program: Option<&pdb2::LineProgram>,
+        source_lines: &crate::legacy::SourceLines,
         has_global_definitions: bool,
     ) -> pdb2::Result<Option<Rc<RefCell<cpp::Module>>>> {
         let mut module_symbols = module_info.symbols()?;
@@ -1459,6 +1468,12 @@ impl Decompiler {
                 let path = PathBuf::from(crate::utils::sanitize_path(file.name.to_string_lossy(strings)?));
                 if !source_files.contains(&path) { source_files.push(path); }
             }
+        }
+        let mut line_paths = source_lines.keys().collect::<Vec<_>>();
+        line_paths.sort();
+        for name in line_paths {
+            let path = PathBuf::from(crate::utils::sanitize_path(name));
+            if !source_files.contains(&path) { source_files.push(path); }
         }
         // DBI file lists are available even when line records or /names are absent.
         if module_file_path.is_none() {
@@ -1540,7 +1555,7 @@ impl Decompiler {
     fn process_module_symbol_data<'d, 'a, 's>(
         &'d mut self,
         context: &mut DecompileContext<'a, 's>,
-        line_offsets: &HashMap<pdb2::StringRef, HashMap<pdb2::PdbInternalSectionOffset, pdb2::LineInfo>>,
+        line_offsets: &crate::legacy::SourceLines,
         module: Rc<RefCell<cpp::Module>>,
         module_symbols: Option<&mut pdb2::SymbolIter>,
         symbol_data: &pdb2::SymbolData,
@@ -1671,14 +1686,14 @@ impl Decompiler {
 
                 for (name_ref, offsets) in line_offsets.iter() {
                     if let Some(line) = offsets.get(&data_symbol.offset) {
-                        file_name_ref = Some(*name_ref);
+                        file_name_ref = Some(name_ref);
                         line_info = Some(line.clone());
                         break;
                     }
                 }
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -1766,14 +1781,14 @@ impl Decompiler {
 
                 for (name_ref, offsets) in line_offsets.iter() {
                     if let Some(line) = offsets.get(&thread_storage_symbol.offset) {
-                        file_name_ref = Some(*name_ref);
+                        file_name_ref = Some(name_ref);
                         line_info = Some(line.clone());
                         break;
                     }
                 }
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -2005,7 +2020,7 @@ impl Decompiler {
 
                 for (name_ref, offsets) in line_offsets.iter() {
                     if let Some(line) = offsets.get(&procedure_symbol.offset) {
-                        file_name_ref = Some(*name_ref);
+                        file_name_ref = Some(name_ref);
                         line_info = Some(line.clone());
                         break;
                     }
@@ -2022,7 +2037,7 @@ impl Decompiler {
                 let address = self.options.base_address.unwrap_or(0) + rva.0 as u64;
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -2487,14 +2502,14 @@ impl Decompiler {
 
                 for (name_ref, offsets) in line_offsets.iter() {
                     if let Some(_line) = offsets.get(&public_symbol.offset) {
-                        file_name_ref = Some(*name_ref);
+                        file_name_ref = Some(name_ref);
                         // line_info = Some(line.clone());
                         break;
                     }
                 }
 
                 let module = if let Some(file_name_ref) = file_name_ref {
-                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref.to_string_lossy(context.string_table.ok_or(pdb2::Error::StreamNameNotFound)?)?.to_string()));
+                    let path = PathBuf::from(crate::utils::sanitize_path(file_name_ref));
                     let module_key = path.to_string_lossy().to_lowercase().to_string();
                     self.modules.entry(module_key).or_insert_with(|| Rc::new(RefCell::new(cpp::Module::default().with_path(path)))).clone()
                 } else {
@@ -2525,6 +2540,15 @@ impl Decompiler {
             | pdb2::SymbolData::Label(_)
             | pdb2::SymbolData::EnvBlock(_) => {
                 // println!("WARNING: Unused {symbol_data:#?}");
+            }
+
+            pdb2::SymbolData::Section(_) | pdb2::SymbolData::CoffGroup(_)
+            | pdb2::SymbolData::Trampoline(_) => {
+                // Linker modules can own globals even without a source filename.
+                // Keep their section metadata without trying to turn it into C++ declarations.
+                module.borrow_mut().members.push(cpp::ModuleMember::Comment(
+                    format!("PDB linker metadata: {symbol_data:?}").replace("*/", "* /"),
+                ));
             }
 
             ref data => panic!("Unhandled symbol data in process_module_symbol_data - {data:#?}"),
